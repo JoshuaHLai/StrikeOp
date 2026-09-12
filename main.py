@@ -1,26 +1,37 @@
-import os
-from dotenv import load_dotenv
 import argparse
+import logging
+import os
 
 import yfinance as yf
-
+from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 
-def process(ticker, routine):
-    
-    #Initialize Ticker Object
-    data = yf.Ticker(ticker)
+logging.basicConfig(level=logging.INFO, format="%(message)s")
+logger = logging.getLogger(__name__)
 
-    #Get financials and data
+
+def process(ticker, routine):
+    """Fetch fundamentals for `ticker` and screen it.
+
+    `routine` == 'heuristic' computes the ratios and returns without
+    screening (useful for inspecting numbers without the bank-only filter).
+    Any other value applies the bank-specific value screen.
+
+    Returns the ticker string if it passes screening (or if no screening
+    applies), otherwise None.
+    """
+    data = yf.Ticker(ticker)
     info = data.info
 
     balance_sheet = data.balance_sheet
+    if balance_sheet.empty:
+        logger.warning("No balance sheet data available for %s, skipping.", ticker)
+        return None
     key = balance_sheet.keys()[0]
 
-    pe_ratio = data.info["forwardPE"]
-    pb_ratio = data.info["priceToBook"]
-    current_price = data.info["currentPrice"]
+    pe_ratio = info["forwardPE"]
+    pb_ratio = info["priceToBook"]
 
     long_term_debt = balance_sheet[key]["Long Term Debt"]
     short_term_debt = 0
@@ -29,74 +40,79 @@ def process(ticker, routine):
 
     try:
         short_term_debt = balance_sheet[key]["Short Long Term Debt"]
-    except:
-        print("No Short Long Term Debt Exists...")
+    except KeyError:
+        logger.info("No Short Long Term Debt line item for %s.", ticker)
 
     total_debt = long_term_debt + short_term_debt
 
-    if routine == 'heuristic':
-        return
+    if routine == "heuristic":
+        return ticker
 
-    if data.info["industry"] == "Banks - Diversified":
-
+    if info["industry"] == "Banks - Diversified":
         if pe_ratio > 50:
-            print("Price-to-Earnings Ratio Too High...")
+            logger.info("%s: Price-to-Earnings Ratio Too High.", ticker)
             return None
-        elif pb_ratio < 1 and pb_ratio > 2.5:
-            print("Price-to-Book Ratio Not Optimal...")
+        elif pb_ratio < 1 or pb_ratio > 2.5:
+            logger.info("%s: Price-to-Book Ratio Not Optimal.", ticker)
             return None
         elif pb_ratio * pe_ratio > 35:
-            print("Graham Number Too High...")
+            logger.info("%s: Graham Number Too High.", ticker)
             return None
-        elif total_debt / equity < 2:
-            print(total_debt / equity)
-            print("Debt-to-Equity Ratio Too High")
+        elif total_debt / equity > 2:
+            logger.info("%s: Debt-to-Equity Ratio Too High (%.2f).", ticker, total_debt / equity)
             return None
-
-    #print("JPM is a solid stock to buy")
 
     return ticker
 
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Screen stocks and summarize recent news via Gemini.")
+    parser.add_argument("--tickers", nargs="+", default=["JPM"], help="Ticker symbols to screen.")
+    parser.add_argument(
+        "--routine",
+        choices=["heuristic", "full"],
+        default="full",
+        help="'heuristic' skips the bank value screen; 'full' applies it.",
+    )
+    return parser.parse_args()
+
+
 def main():
-
+    """Load config, screen the requested tickers, and ask Gemini about any that pass."""
     load_dotenv()
+    args = parse_args()
 
-    #ArgParse code in case I want to make this more CLI based rather than hard-code tickers
-    """
-    parser = argparse.ArgumentParser()
-    parser.add_argument()
-    args = parser.parse_args()
-    """
+    gemini_api_key = os.getenv("API_TOKEN")
+    if not gemini_api_key:
+        logger.error("Authentication Error: API_TOKEN is not set in the environment.")
+        return
+    os.environ["GEMINI_API_KEY"] = gemini_api_key
+    logger.info("Gemini API key setup complete.")
 
-    #Gemini API key to scrape relevant news of stocks
-    try:
-        gemini_api_key = os.getenv("API_TOKEN")
-        os.environ["GEMINI_API_KEY"] = gemini_api_key
-        print("✅ Gemini API key setup complete.")
-    except:
-        print(f"Authentication Error: {e}")
-
-    tickers = ["JPM"] #, "COST", "SMFG"]
     valid_stocks = []
 
-    for stock in tickers:
-        print("Fetching data for %s" % (stock))
-        ticker = process(stock)
-        if type(ticker) == "str":
-            valid_stocks.append()
+    for stock in args.tickers:
+        logger.info("Fetching data for %s", stock)
+        ticker = process(stock, args.routine)
+        if isinstance(ticker, str):
+            valid_stocks.append(ticker)
 
     if valid_stocks:
-
         client = genai.Client()
 
+        tickers_str = ", ".join(valid_stocks)
         response = client.models.generate_content(
-            model = "gemini-3-flash-preview",
-            contents = "Gather all news released in the last 6 months about JPM stock, positive and negative. Analyze everything and provide brief points about your analysis. Based on your analysis, should I buy right now?",
-            config = types.GenerateContentConfig(thinking_config = types.ThinkingConfig(thinking_level = "low"))
+            model="gemini-3-flash-preview",
+            contents=(
+                f"Gather all news released in the last 6 months about the following stocks, "
+                f"positive and negative: {tickers_str}. Analyze everything and provide brief "
+                f"points about your analysis. Based on your analysis, should I buy right now?"
+            ),
+            config=types.GenerateContentConfig(thinking_config=types.ThinkingConfig(thinking_level="low")),
         )
 
         print(response.text)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
